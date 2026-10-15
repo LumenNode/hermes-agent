@@ -1,0 +1,79 @@
+name: "PROOF #138754 (temporary, never merge)"
+on:
+  push:
+    branches: ['proof/138754-**']
+permissions:
+  contents: read
+jobs:
+  live:
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [base, head]
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Base leg uses main's Desktop ticket code
+        if: matrix.leg == 'base'
+        timeout-minutes: 2
+        run: |
+          git show db44c46208f1b421b4ecb7e56bf9d68b0423906f:apps/desktop/electron/local-gateway.ts > apps/desktop/electron/local-gateway.ts
+          # main has no reservedHome: export main's own home resolution (fs.realpath) under that name
+          printf '\nexport async function reservedHome(dir: string): Promise<string> { return fs.realpath(dir) }\n' >> apps/desktop/electron/local-gateway.ts
+          git diff --stat
+      - name: Set up locked PM toolchain (Python + Node), core runtime
+        id: pm
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          extras: '[]'
+      - name: npm ci
+        timeout-minutes: 15
+        run: npm ci --no-audit --no-fund --ignore-scripts
+      - name: Volume is case-insensitive
+        timeout-minutes: 2
+        run: |
+          mkdir -p "$HOME/probe/hcase/.hermes"
+          test -d "$HOME/probe/HCASE/.hermes" && echo "case-insensitive: yes"
+          python3 -c "import os,sys; p=os.path.expanduser('~/probe/HCASE/.hermes'); print('python resolve:', __import__('pathlib').Path(p).resolve())"
+          node -e "console.log('node realpath:', require('fs').realpathSync(process.env.HOME + '/probe/HCASE/.hermes'))"
+      - name: "Live: Desktop attaches to a real gateway whose home is spelled in another case"
+        timeout-minutes: 10
+        working-directory: apps/desktop
+        env:
+          PY: ${{ steps.pm.outputs.python-path }}
+        run: |
+          V="$HOME/probe/HCASE"
+          printf 'model:\n  default: test-model\n  provider: openrouter\n' > "$V/.hermes/config.yaml"
+          chmod -R go-w "$HOME/probe"
+          set +e
+          HOME="$V" HERMES_HOME="$V/.hermes" PYTHONPATH="$GITHUB_WORKSPACE" \
+            PROBE_HOME="$V/.hermes" PROBE_HERMES="$PY" PROBE_ARGS_PREFIX="-m hermes_cli.main" \
+            PROBE_ROUTES="/api/profiles,/api/sessions?profile=default" PROBE_OUT="$RUNNER_TEMP/result.json" \
+            npx vitest run --project electron electron/zz-live-probe-138754.test.ts > "$RUNNER_TEMP/probe.log" 2>&1
+          echo "probe vitest exit=$?"
+          echo "RESULT ${{ matrix.leg }}: $(cat "$RUNNER_TEMP/result.json" 2>/dev/null || echo none)"
+          HOME="$V" HERMES_HOME="$V/.hermes" PYTHONPATH="$GITHUB_WORKSPACE" "$PY" -m hermes_cli.main gateway stop > "$RUNNER_TEMP/stop.log" 2>&1
+          echo "gateway stop exit=$?"
+          tail -40 "$RUNNER_TEMP/probe.log"
+      - name: PR's own identity tests on this Mac
+        timeout-minutes: 8
+        working-directory: apps/desktop
+        env:
+          HERMES_TEST_PYTHON: ${{ steps.pm.outputs.python-path }}
+        run: |
+          set +e
+          npx vitest run --project electron electron/local-gateway-ticket-identity.test.ts --reporter=verbose > "$RUNNER_TEMP/identity.log" 2>&1
+          echo "identity exit=$?"
+          grep -E "✓|×|↓|Tests |Error" "$RUNNER_TEMP/identity.log" | head -30
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: proof-138754-${{ matrix.leg }}
+          path: ${{ runner.temp }}/*.log
+          if-no-files-found: ignore
